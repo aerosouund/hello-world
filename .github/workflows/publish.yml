@@ -109,7 +109,11 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          # signing config from the Sigstore TUF root, with Rekor v2 as the transparency log
+          cosign signing-config create --with-default-rekor-v2 --out signing-config.json
+          jq '.rekorTlogUrls' signing-config.json
           cosign attest --yes \
+            --signing-config signing-config.json \
             --type slsaprovenance1 \
             --predicate provenance.json \
             "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
