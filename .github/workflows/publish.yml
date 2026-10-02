@@ -1,4 +1,4 @@
-name: Build, Push and Sign
+name: Build, Push and Attest
 
 on:
   push:
@@ -15,12 +15,12 @@ env:
 jobs:
 
   build-push-sign:
-    name: Build, Push and Sign (linux/amd64)
+    name: Build, Push and Attest (linux/amd64)
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      # required for keyless (OIDC) cosign signing
+      # required for keyless (OIDC) cosign attestation
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -59,16 +59,65 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign image (keyless)
+      - name: Generate SLSA provenance predicate
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          jq -n \
+            --arg server "$SERVER_URL" \
+            --arg repo "$REPOSITORY" \
+            --arg ref "$REF" \
+            --arg sha "$SHA" \
+            --arg workflowRef "$WORKFLOW_REF" \
+            --arg event "$EVENT_NAME" \
+            --arg runId "$RUN_ID" \
+            --arg attempt "$RUN_ATTEMPT" \
+            '{
+              buildDefinition: {
+                buildType: "https://actions.github.io/buildtypes/workflow/v1",
+                externalParameters: {
+                  workflow: {
+                    ref: $ref,
+                    repository: "\($server)/\($repo)",
+                    path: ($workflowRef | sub("^[^/]+/[^/]+/"; "") | sub("@.*$"; ""))
+                  }
+                },
+                internalParameters: {
+                  github: { event_name: $event }
+                },
+                resolvedDependencies: [
+                  { uri: "git+\($server)/\($repo)@\($ref)", digest: { gitCommit: $sha } }
+                ]
+              },
+              runDetails: {
+                builder: { id: "\($server)/\($workflowRef)" },
+                metadata: { invocationId: "\($server)/\($repo)/actions/runs/\($runId)/attempts/\($attempt)" }
+              }
+            }' > provenance.json
+          cat provenance.json
 
-      - name: Verify signature
+      - name: Attest provenance (keyless)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          cosign verify \
+          cosign attest --yes \
+            --type slsaprovenance1 \
+            --predicate provenance.json \
+            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+
+      - name: Verify attestation
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify-attestation \
+            --type slsaprovenance1 \
             --certificate-identity "https://github.com/${{ github.workflow_ref }}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+            "${REGISTRY}/${IMAGE_NAME}@${DIGEST}" > /dev/null
